@@ -1,0 +1,30 @@
+#!/bin/sh
+# Commit message hook to enforce Conventional Commits.
+# Allows messages like: feat(parser)!: add support for arrays
+
+commit_msg_file="$1"
+first_line="$(head -n1 "$commit_msg_file")"
+
+# Skip merge commits
+case "$first_line" in
+  Merge\ *)
+    exit 0
+    ;;
+esac
+
+# Conventional Commits regex (case-insensitive):
+# type(scope)?(!)?: subject
+regex='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._-]+\))?(!)?: [^ ].+'
+
+echo "$first_line" | grep -Eiq "$regex"
+if [ "$?" -eq 0 ]; then
+  exit 0
+fi
+
+echo "Commit message does not follow Conventional Commits." >&2
+echo "Examples:" >&2
+echo "  feat(parser): add ability to parse arrays" >&2
+echo "  fix(auth)!: reject empty passwords" >&2
+echo "  docs: update README with usage examples" >&2
+echo "See https://www.conventionalcommits.org/ for details." >&2
+exit 1
