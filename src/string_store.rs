@@ -6,19 +6,23 @@
 //!
 //! On-disk segment layout (little-endian throughout):
 //! ```text
-//! [Header]                      magic + version + flags
-//! [Block 0 | payload | trailer] payload = concatenated entries, trailer = entry offsets
-//! [Block 1 | ... ]
-//! ...
+//! [Header]                      magic(4) + version(2) + flags(2)
+//! [Block 0 | payload | trailer] uncompressed: payload = concatenated entries
+//!                                compressed:  payload = [u32 orig_len][algo bytes]
+//!                               trailer = [u32 entry_offsets...][u32 count]
+//! [Block N-1 | ... ]
 //! [BlockDirectory]              per-block file offset, payload len, entry count
 //! [Footer]                      directory location, counts, flags, crc, magic
 //! ```
-//! Each entry: `[hash128 (16)] [varint len] [utf8 bytes] [crc32 (4)]`.
+//! Entry format: `[hash128 (16)] [varint len] [utf8 bytes] [crc32 (4)]`.
+//! Entry offsets in the trailer always refer to the **uncompressed** payload.
 //!
-//! v1 limitations (seams left for later): block payloads are uncompressed and the
-//! optional Bloom filter is not built (footer `flags` records their absence);
-//! `save` rewrites the whole segment rather than appending incrementally. The
-//! in-memory model is genuinely append-only — existing entries are never mutated.
+//! Format version 1: always uncompressed (header flags ignored).
+//! Format version 2: header flags bits 1–0 select the compression algorithm.
+//!
+//! v2 limitations (seams left for later): the optional Bloom filter is not yet
+//! built (footer `flags` records its absence); `save` rewrites the whole segment
+//! rather than appending incrementally.
 //!
 //! Large values: today every string lands inline in a block. A future value
 //! type may divert long strings/blobs to a dedicated, more space-efficient
@@ -44,9 +48,40 @@ impl StrHash {
     }
 }
 
+/// Block payload compression algorithm written into header flags bits 1–0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Compression {
+    /// No compression (default).
+    #[default]
+    None,
+    /// LZ4 block compression via `lz4_flex` (pure Rust, fast, ~2–4× ratio).
+    Lz4,
+    /// Zstd compression via `zstd` (level 3 default, ~3–6× ratio).
+    Zstd,
+}
+
+impl Compression {
+    fn flag_bits(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Lz4 => 1,
+            Self::Zstd => 2,
+        }
+    }
+
+    fn from_flag_bits(bits: u16) -> io::Result<Self> {
+        match bits & 0x3 {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Lz4),
+            2 => Ok(Self::Zstd),
+            _ => Err(corrupt("unsupported compression algorithm in header flags")),
+        }
+    }
+}
+
 const HEADER_MAGIC: u32 = 0x5353_474D; // "MGSS" little-endian
 const FOOTER_MAGIC: u32 = 0x4655_5353; // "SSUF" little-endian
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const HEADER_LEN: usize = 8; // magic(4) + version(2) + flags(2)
 const FOOTER_LEN: usize = 40;
 const DEFAULT_BLOCK_TARGET: usize = 64 * 1024;
@@ -71,6 +106,8 @@ pub struct StringStore {
     by_hash: HashMap<u128, StrId>,
     /// Soft cap that triggers opening a fresh block.
     block_target: usize,
+    /// Compression algorithm applied when saving.
+    compression: Compression,
 }
 
 impl Default for StringStore {
@@ -80,9 +117,15 @@ impl Default for StringStore {
 }
 
 impl StringStore {
-    /// Create an empty store with the default ~64 KiB block target.
+    /// Create an empty store with the default ~64 KiB block target and no compression.
     pub fn new() -> Self {
         Self::with_block_target(DEFAULT_BLOCK_TARGET)
+    }
+
+    /// Set the compression algorithm used when saving. Call before `save`.
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     fn with_block_target(block_target: usize) -> Self {
@@ -92,6 +135,7 @@ impl StringStore {
             by_id: Vec::new(),
             by_hash: HashMap::new(),
             block_target,
+            compression: Compression::None,
         }
     }
 
@@ -107,6 +151,8 @@ impl StringStore {
 
     /// Intern `s`, returning its hash and id. Idempotent: an already-present
     /// string yields its existing id and hash without storing a duplicate.
+    ///
+    /// This is the single choke point for future long-value routing.
     pub fn intern(&mut self, s: &str) -> (StrHash, StrId) {
         let hash = xxhash_rust::xxh3::xxh3_128(s.as_bytes());
         if let Some(&id) = self.by_hash.get(&hash) {
@@ -166,7 +212,6 @@ impl StringStore {
         Some(StrHash(h))
     }
 
-    /// Index of a block with room to append; opens a new one when needed.
     fn ensure_block(&mut self) -> usize {
         let need_new = match self.blocks.last() {
             None => true,
@@ -181,22 +226,27 @@ impl StringStore {
 
     /// Serialize the whole store to a segment file at `path`.
     ///
-    /// v1 writes via a temp file + rename so a crash mid-write cannot corrupt an
+    /// Writes via a temp file + rename so a crash mid-write cannot corrupt an
     /// existing segment.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let mut buf = Vec::new();
 
-        // Header.
+        // Header: flags bits 1–0 encode the compression algorithm.
         buf.extend_from_slice(&HEADER_MAGIC.to_le_bytes());
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes()); // flags: no compression, no bloom
+        buf.extend_from_slice(&self.compression.flag_bits().to_le_bytes());
 
-        // Blocks: payload then entry-offset trailer.
+        // Blocks: payload (possibly compressed) then entry-offset trailer.
         let mut dir_entries: Vec<(u64, u32, u32)> = Vec::with_capacity(self.blocks.len());
         for (block, offsets) in self.blocks.iter().zip(&self.block_offsets) {
             let file_offset = buf.len() as u64;
-            let payload_len = block.len() as u32;
-            buf.extend_from_slice(block);
+            let payload = if self.compression == Compression::None {
+                block.as_slice().to_owned()
+            } else {
+                compress_payload(block, self.compression)?
+            };
+            let payload_len = payload.len() as u32;
+            buf.extend_from_slice(&payload);
             for &off in offsets {
                 buf.extend_from_slice(&off.to_le_bytes());
             }
@@ -217,12 +267,12 @@ impl StringStore {
         let dir_len = dir.len() as u32;
         buf.extend_from_slice(&dir);
 
-        // Footer (fixed 40 bytes, read from end of file).
+        // Footer (fixed 40 bytes).
         buf.extend_from_slice(&dir_offset.to_le_bytes()); // 8
         buf.extend_from_slice(&dir_len.to_le_bytes()); // 4
         buf.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes()); // 4
         buf.extend_from_slice(&(self.by_id.len() as u64).to_le_bytes()); // 8
-        buf.extend_from_slice(&0u32.to_le_bytes()); // 4 flags
+        buf.extend_from_slice(&0u32.to_le_bytes()); // 4 flags (bloom not built)
         buf.extend_from_slice(&0u32.to_le_bytes()); // 4 reserved
         buf.extend_from_slice(&dir_crc.to_le_bytes()); // 4
         buf.extend_from_slice(&FOOTER_MAGIC.to_le_bytes()); // 4
@@ -235,6 +285,9 @@ impl StringStore {
     }
 
     /// Load a store from a segment file, rebuilding the in-RAM indexes.
+    ///
+    /// Supports format versions 1 (always uncompressed) and 2 (compression
+    /// signalled by header flags).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let data = std::fs::read(path)?;
         if data.len() < HEADER_LEN + FOOTER_LEN {
@@ -243,6 +296,15 @@ impl StringStore {
         if read_u32(&data, 0) != HEADER_MAGIC {
             return Err(corrupt("bad header magic"));
         }
+        let file_version = read_u16(&data, 4);
+        if file_version != 1 && file_version != FORMAT_VERSION {
+            return Err(corrupt("unsupported format version"));
+        }
+        let compression = if file_version >= 2 {
+            Compression::from_flag_bits(read_u16(&data, 6))?
+        } else {
+            Compression::None
+        };
 
         let f = data.len() - FOOTER_LEN;
         if read_u32(&data, f + 36) != FOOTER_MAGIC {
@@ -265,6 +327,7 @@ impl StringStore {
         }
 
         let mut store = StringStore::with_block_target(DEFAULT_BLOCK_TARGET);
+        store.compression = compression;
         let mut dp = 4;
         for _ in 0..block_count {
             let file_offset = read_u64(dir, dp) as usize;
@@ -272,7 +335,13 @@ impl StringStore {
             let entry_count = read_u32(dir, dp + 12) as usize;
             dp += 16;
 
-            let payload = data[file_offset..file_offset + payload_len].to_vec();
+            let raw = data[file_offset..file_offset + payload_len].to_vec();
+            let payload = if compression == Compression::None {
+                raw
+            } else {
+                decompress_payload(&raw, compression)?
+            };
+
             let trailer_start = file_offset + payload_len;
             let mut offsets = Vec::with_capacity(entry_count);
             for i in 0..entry_count {
@@ -280,7 +349,6 @@ impl StringStore {
             }
 
             let block_idx = store.blocks.len() as u32;
-            // Rebuild id/hash indexes from the entries in this block.
             for &entry_off in &offsets {
                 let off = entry_off as usize;
                 let hash = read_u128(&payload, off);
@@ -309,11 +377,50 @@ impl StringStore {
     }
 }
 
+// ── Compression helpers ──────────────────────────────────────────────────────
+
+/// Compress `data` and prefix the result with the original (uncompressed) length.
+fn compress_payload(data: &[u8], algo: Compression) -> io::Result<Vec<u8>> {
+    match algo {
+        Compression::None => unreachable!(),
+        // lz4_flex::compress_prepend_size writes a little-endian u32 length prefix.
+        Compression::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
+        Compression::Zstd => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&zstd::encode_all(std::io::Cursor::new(data), 3)?);
+            Ok(out)
+        }
+    }
+}
+
+/// Decompress a payload that was written by `compress_payload`.
+fn decompress_payload(data: &[u8], algo: Compression) -> io::Result<Vec<u8>> {
+    if data.len() < 4 {
+        return Err(corrupt("compressed block too small"));
+    }
+    match algo {
+        Compression::None => unreachable!(),
+        // lz4_flex reads the u32 length prefix automatically.
+        Compression::Lz4 => lz4_flex::decompress_size_prepended(data)
+            .map_err(|e| corrupt(&e.to_string())),
+        Compression::Zstd => {
+            let uncompressed_len = read_u32(data, 0) as usize;
+            let decoded = zstd::decode_all(std::io::Cursor::new(&data[4..]))?;
+            if decoded.len() != uncompressed_len {
+                return Err(corrupt("zstd decompressed size mismatch"));
+            }
+            Ok(decoded)
+        }
+    }
+}
+
+// ── Low-level helpers ────────────────────────────────────────────────────────
+
 fn corrupt(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("string store: {msg}"))
 }
 
-/// LEB128 unsigned varint length of `n`.
 fn varint_len(mut n: u64) -> usize {
     let mut len = 1;
     while n >= 0x80 {
@@ -331,7 +438,6 @@ fn write_varint(buf: &mut Vec<u8>, mut n: u64) {
     buf.push(n as u8);
 }
 
-/// Returns (value, bytes consumed).
 fn read_varint(buf: &[u8], mut pos: usize) -> (u64, usize) {
     let mut result = 0u64;
     let mut shift = 0;
@@ -348,6 +454,10 @@ fn read_varint(buf: &[u8], mut pos: usize) -> (u64, usize) {
     (result, pos - start)
 }
 
+fn read_u16(buf: &[u8], pos: usize) -> u16 {
+    u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap())
+}
+
 fn read_u32(buf: &[u8], pos: usize) -> u32 {
     u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap())
 }
@@ -359,6 +469,8 @@ fn read_u64(buf: &[u8], pos: usize) -> u64 {
 fn read_u128(buf: &[u8], pos: usize) -> u128 {
     u128::from_le_bytes(buf[pos..pos + 16].try_into().unwrap())
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -422,13 +534,12 @@ mod tests {
         src.save(&path).unwrap();
 
         let loaded = StringStore::open(&path).unwrap();
-        assert_eq!(loaded.len(), 5); // "two" deduped
+        assert_eq!(loaded.len(), 5);
         assert_eq!(loaded.resolve_id(ids[0]), Some("one"));
         assert_eq!(loaded.resolve_id(ids[2]), Some("three"));
         assert_eq!(loaded.resolve_id(ids[3]), Some("two"));
         assert_eq!(loaded.resolve_id(ids[5]), Some("🦀"));
 
-        // Hash identity survives the roundtrip.
         let (h, _) = src.intern("three");
         assert_eq!(loaded.resolve_hash(h), Some("three"));
 
@@ -440,7 +551,6 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("mgraphdb_ss_mb_{}.seg", std::process::id()));
 
-        // Tiny block target forces many blocks.
         let mut src = StringStore::with_block_target(64);
         let n = 500;
         let ids: Vec<_> = (0..n).map(|i| src.intern(&format!("value-{i}")).1).collect();
@@ -464,10 +574,48 @@ mod tests {
         s.save(&path).unwrap();
 
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[0] ^= 0xff; // corrupt header magic
+        bytes[0] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
         assert!(StringStore::open(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    fn roundtrip_with_compression(algo: Compression) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "mgraphdb_ss_comp_{}_{}.seg",
+            algo.flag_bits(),
+            std::process::id()
+        ));
+        let words = [
+            "the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog",
+            "http://www.w3.org/2002/07/owl#Class",
+            "http://www.w3.org/2002/07/owl#ObjectProperty",
+            "http://xmlns.com/foaf/0.1/Person",
+            "http://xmlns.com/foaf/0.1/name",
+        ];
+        let mut src = StringStore::new().with_compression(algo);
+        let ids: Vec<_> = words.iter().map(|w| src.intern(w).1).collect();
+        src.save(&path).unwrap();
+
+        let loaded = StringStore::open(&path).unwrap();
+        assert_eq!(loaded.compression, algo);
+        for (i, w) in words.iter().enumerate() {
+            assert_eq!(loaded.resolve_id(ids[i]), src.resolve_id(ids[i]));
+            let (h, _) = src.intern(w);
+            assert_eq!(loaded.resolve_hash(h), src.resolve_hash(h));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn roundtrip_lz4() {
+        roundtrip_with_compression(Compression::Lz4);
+    }
+
+    #[test]
+    fn roundtrip_zstd() {
+        roundtrip_with_compression(Compression::Zstd);
     }
 }

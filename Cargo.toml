@@ -6,3 +6,12 @@ edition = "2024"
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
+lz4_flex = "0.13"
+zstd = "0.13"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "string_store"
+harness = false
