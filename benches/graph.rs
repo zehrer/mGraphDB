@@ -78,6 +78,15 @@ fn bench_traverse(c: &mut Criterion) {
             total
         });
     });
+    group.bench_function("in_edges_all", |b| {
+        b.iter(|| {
+            let mut total = 0usize;
+            for node in 0..n {
+                total += g.in_degree(node); // precomputed reverse adjacency
+            }
+            total
+        });
+    });
     group.finish();
 }
 
