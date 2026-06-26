@@ -6,7 +6,8 @@ Designed to be small enough to embed (SQLite-like footprint) while exposing
 several abstraction layers. The data model is uniform: **everything is a node** —
 edges and properties are specialisations of a node.
 
-**Status:** early development — String Store implemented, Persistent Layer in design.
+**Status:** early development — Graph API, Persistent Layer (Node/Property/Edge
+stores + CSR index), and String Store implemented.
 
 ## Project goals
 
@@ -20,12 +21,42 @@ Full design documentation lives in the [wiki](https://github.com/zehrer/mGraphDB
 ## Architecture
 
 ```
-Graph API            (planned)
+Graph API            create / read / traverse nodes, props, edges   ✓ implemented
     │
-Persistent Layer     fixed-length node / edge / property records  (design)
+Persistent Layer     fixed-length node/edge/property records + CSR index  ✓ implemented
     │
-String Store         append-only deduplicated UTF-8 storage        ✓ implemented
+String Store         append-only deduplicated UTF-8 storage          ✓ implemented
 ```
+
+## Graph API
+
+`mgraphdb::graph::Graph` ties the layers together. Edges are just `Edge`-valued
+properties — "everything is a node". Short strings are stored inline; longer
+ones are routed into the String Store automatically.
+
+```rust
+use mgraphdb::graph::Graph;
+use mgraphdb::prop_store::PropValue;
+
+let mut g = Graph::new();
+
+let person = g.add_node();              // a class node, used as a type
+let alice  = g.add_typed_node(person);
+let bob    = g.add_typed_node(person);
+
+g.set_str(alice, "Alice")?;             // inline (≤ 14 bytes)
+g.set_property(alice, &PropValue::I64(30))?;
+g.set_str(bob, "Bob")?;
+g.add_edge(alice, bob)?;                // Alice → Bob
+
+assert_eq!(g.out_edges(alice)?, vec![bob]);
+assert_eq!(g.properties(alice)?.len(), 2);   // name + age (edge excluded)
+
+g.save("graph_dir")?;                   // nodes + props + strings + CSR index
+let reloaded = Graph::open("graph_dir")?;
+```
+
+`cargo run` builds and traverses a small social graph end to end.
 
 ## String Store
 
@@ -64,7 +95,9 @@ let loaded = StringStore::open("my.seg")?;
 | `cargo build --release` | Optimised build |
 | `cargo test` | Run unit tests |
 | `cargo clippy --all-targets -- -D warnings` | Lint gate (zero warnings) |
-| `cargo bench` | Criterion benchmarks (intern, resolve, save/open) |
+| `cargo run` | Run the Graph API demo |
+| `cargo bench --bench string_store` | String Store benchmarks (intern, resolve, save/open) |
+| `cargo bench --bench graph` | Graph benchmarks (build, traverse, index, persist) |
 | `cargo bench -- compression_ratio` | Compression ratio table (LZ4 / Zstd / none) |
 
 ## Commit conventions
