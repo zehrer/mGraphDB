@@ -68,7 +68,20 @@ impl Graph {
     /// Number of nodes (including tombstoned).
     pub fn node_count(&self) -> usize { self.nodes.len() }
 
-    /// Number of property/edge records.
+    /// Number of live (non-deleted) nodes.
+    pub fn live_node_count(&self) -> usize { self.nodes.live_count() }
+
+    /// Whether `node` has been deleted (tombstoned). Out-of-range ids count as
+    /// not-live, so this returns `true` for them as well.
+    pub fn is_deleted(&self, node: NodeId) -> bool {
+        match self.nodes.get(node) {
+            Some(r) => r.flags.is_dead(),
+            None => true,
+        }
+    }
+
+    /// Number of property/edge records ever created (including those orphaned by
+    /// node deletion).
     pub fn record_count(&self) -> usize { self.props.len() }
 
     /// Create a plain node and return its id.
@@ -87,11 +100,51 @@ impl Graph {
         id
     }
 
+    /// Delete `node` (soft delete / tombstone) and detach it from the graph.
+    ///
+    /// Cleanup is symmetric so no dangling references remain:
+    /// * the node's outgoing edges are removed from each target's incoming list;
+    /// * the node's incoming edges are removed from each source's owned records,
+    ///   so those sources no longer report an edge to the deleted node;
+    /// * all of the node's owned records and the edge records pointing at it are
+    ///   overwritten with [`PropValue::None`] (their slots are not reclaimed —
+    ///   `record_count` is unchanged);
+    /// * the node is tombstoned in the Node Store.
+    ///
+    /// Returns `Ok(false)` if `node` is out of range or already deleted.
+    pub fn delete_node(&mut self, node: NodeId) -> io::Result<bool> {
+        match self.nodes.get(node) {
+            Some(r) if !r.flags.is_dead() => {}
+            _ => return Ok(false),
+        }
+
+        // 1. Outgoing edges → detach from each target's incoming list.
+        let owned = std::mem::take(&mut self.adjacency[node as usize]);
+        for &pid in &owned {
+            if let Some(PropValue::Edge { end_node }) = self.props.get(pid)? {
+                self.incoming[end_node as usize]
+                    .retain(|&(src, p)| !(src == node && p == pid));
+            }
+            self.props.update(pid, &PropValue::None)?;
+        }
+
+        // 2. Incoming edges → detach the edge record from each source's records.
+        let incoming = std::mem::take(&mut self.incoming[node as usize]);
+        for &(src, pid) in &incoming {
+            self.adjacency[src as usize].retain(|&p| p != pid);
+            self.props.update(pid, &PropValue::None)?;
+        }
+
+        // 3. Tombstone. (Owned/incoming vecs were already emptied by mem::take.)
+        self.nodes.tombstone(node);
+        Ok(true)
+    }
+
     // ── Properties ─────────────────────────────────────────────────────────
 
     /// Attach a typed property `value` to `node`. Returns the new `PropId`.
     pub fn set_property(&mut self, node: NodeId, value: &PropValue) -> io::Result<PropId> {
-        self.check_node(node)?;
+        self.check_live(node)?;
         let pid = self.props.create(value)?;
         self.adjacency[node as usize].push(pid);
         self.set_flag(node, NodeFlags::HAS_PROP)?;
@@ -118,8 +171,8 @@ impl Graph {
     /// The edge is owned by `from`; `from` gains `HAS_OUT` and `to` gains
     /// `HAS_IN`.
     pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> io::Result<PropId> {
-        self.check_node(from)?;
-        self.check_node(to)?;
+        self.check_live(from)?;
+        self.check_live(to)?;
         let pid = self.props.create(&PropValue::Edge { end_node: to })?;
         self.adjacency[from as usize].push(pid);
         self.incoming[to as usize].push((from, pid));
@@ -279,14 +332,18 @@ impl Graph {
 
     // ── Internals ──────────────────────────────────────────────────────────
 
-    fn check_node(&self, node: NodeId) -> io::Result<()> {
-        if (node as usize) < self.nodes.len() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
+    /// Validate that `node` exists and is live, for write operations.
+    fn check_live(&self, node: NodeId) -> io::Result<()> {
+        match self.nodes.get(node) {
+            Some(r) if !r.flags.is_dead() => Ok(()),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("graph: node {node} is deleted"),
+            )),
+            None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("graph: node {node} out of range (count {})", self.nodes.len()),
-            ))
+            )),
         }
     }
 
@@ -452,6 +509,88 @@ mod tests {
         // degree() counts all 3 records; out_degree() counts the 1 edge.
         assert_eq!(g.degree(a), 3);
         assert_eq!(g.out_degree(a).unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_node_detaches_both_directions() {
+        let mut g = Graph::new();
+        let a = g.add_node();
+        let b = g.add_node();
+        let c = g.add_node();
+        // a → b, b → c, c → b
+        g.add_edge(a, b).unwrap();
+        g.add_edge(b, c).unwrap();
+        g.add_edge(c, b).unwrap();
+        g.set_str(b, "Bob").unwrap();
+
+        assert!(g.delete_node(b).unwrap());
+        assert!(g.is_deleted(b));
+        assert_eq!(g.live_node_count(), 2);
+
+        // a no longer reports an edge to b (b was a's outgoing target).
+        assert_eq!(g.out_edges(a).unwrap(), vec![]);
+        // c no longer reports an edge to b either.
+        assert_eq!(g.out_edges(c).unwrap(), vec![]);
+        // b's own outgoing edge (b → c) is gone from c's incoming list.
+        assert_eq!(g.in_degree(c), 0);
+        // b itself is fully detached.
+        assert_eq!(g.degree(b), 0);
+        assert_eq!(g.in_degree(b), 0);
+    }
+
+    #[test]
+    fn delete_node_is_idempotent_and_guards_writes() {
+        let mut g = Graph::new();
+        let a = g.add_node();
+        let b = g.add_node();
+        g.add_edge(a, b).unwrap();
+
+        assert!(g.delete_node(b).unwrap());
+        // Already deleted / out of range → false, no error.
+        assert!(!g.delete_node(b).unwrap());
+        assert!(!g.delete_node(99).unwrap());
+
+        // Writes touching a deleted node are rejected.
+        assert!(g.set_property(b, &PropValue::None).is_err());
+        assert!(g.add_edge(a, b).is_err());
+        assert!(g.add_edge(b, a).is_err());
+        // Live node still works.
+        assert!(g.set_str(a, "ok").is_ok());
+    }
+
+    #[test]
+    fn delete_node_handles_self_loop() {
+        let mut g = Graph::new();
+        let a = g.add_node();
+        g.add_edge(a, a).unwrap(); // self-loop
+        assert_eq!(g.in_degree(a), 1);
+
+        assert!(g.delete_node(a).unwrap());
+        assert!(g.is_deleted(a));
+        assert_eq!(g.degree(a), 0);
+        assert_eq!(g.in_degree(a), 0);
+    }
+
+    #[test]
+    fn deletion_survives_save_open() {
+        let dir = std::env::temp_dir().join(format!("mgraphdb_graph_del_{}", std::process::id()));
+
+        let mut g = Graph::new();
+        let a = g.add_node();
+        let b = g.add_node();
+        let c = g.add_node();
+        g.add_edge(a, b).unwrap();
+        g.add_edge(b, c).unwrap();
+        g.delete_node(b).unwrap();
+        g.save(&dir).unwrap();
+
+        let loaded = Graph::open(&dir).unwrap();
+        assert!(loaded.is_deleted(b));
+        assert_eq!(loaded.live_node_count(), 2);
+        assert_eq!(loaded.out_edges(a).unwrap(), vec![]); // a→b detached
+        assert_eq!(loaded.in_degree(c), 0);               // b→c detached
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
