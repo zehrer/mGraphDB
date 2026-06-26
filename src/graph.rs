@@ -30,6 +30,10 @@ pub struct Graph {
     strings: StringStore,
     /// `adjacency[node]` = the PropIds owned by `node`, in insertion order.
     adjacency: Vec<Vec<PropId>>,
+    /// `incoming[node]` = `(source, edge PropId)` for every edge pointing at
+    /// `node`, in the order the edges were added. Reverse of `adjacency`'s
+    /// edge entries; derived (rebuilt from the edges on `open`).
+    incoming: Vec<Vec<(NodeId, PropId)>>,
 }
 
 impl Default for Graph {
@@ -44,6 +48,7 @@ impl Graph {
             props: PropStore::new(),
             strings: StringStore::new(),
             adjacency: Vec::new(),
+            incoming: Vec::new(),
         }
     }
 
@@ -54,6 +59,7 @@ impl Graph {
             props: PropStore::new(),
             strings: StringStore::new().with_compression(compression),
             adjacency: Vec::new(),
+            incoming: Vec::new(),
         }
     }
 
@@ -69,6 +75,7 @@ impl Graph {
     pub fn add_node(&mut self) -> NodeId {
         let id = self.nodes.create();
         self.adjacency.push(Vec::new());
+        self.incoming.push(Vec::new());
         id
     }
 
@@ -76,6 +83,7 @@ impl Graph {
     pub fn add_typed_node(&mut self, type_id: NodeId) -> NodeId {
         let id = self.nodes.create_typed(type_id);
         self.adjacency.push(Vec::new());
+        self.incoming.push(Vec::new());
         id
     }
 
@@ -114,6 +122,7 @@ impl Graph {
         self.check_node(to)?;
         let pid = self.props.create(&PropValue::Edge { end_node: to })?;
         self.adjacency[from as usize].push(pid);
+        self.incoming[to as usize].push((from, pid));
         self.set_flag(from, NodeFlags::HAS_OUT)?;
         self.set_flag(to, NodeFlags::HAS_IN)?;
         Ok(pid)
@@ -161,6 +170,40 @@ impl Graph {
             }
         }
         Ok(out)
+    }
+
+    /// The `(source, edge PropId)` pairs of every edge pointing **at** `node`,
+    /// in the order the edges were added. Served from the precomputed reverse
+    /// adjacency, so no record decoding is needed.
+    pub fn in_edges(&self, node: NodeId) -> &[(NodeId, PropId)] {
+        match self.incoming.get(node as usize) {
+            Some(v) => v,
+            None => &[],
+        }
+    }
+
+    /// The source nodes of all incoming edges of `node`, in insertion order.
+    pub fn in_neighbors(&self, node: NodeId) -> Vec<NodeId> {
+        self.in_edges(node).iter().map(|&(src, _)| src).collect()
+    }
+
+    /// Number of edges pointing at `node` (its in-degree).
+    pub fn in_degree(&self, node: NodeId) -> usize {
+        self.in_edges(node).len()
+    }
+
+    /// Number of outgoing edges of `node` (its out-degree).
+    ///
+    /// Unlike [`Graph::degree`] (which counts all owned records, properties
+    /// included), this counts only edges and so must decode each record.
+    pub fn out_degree(&self, node: NodeId) -> io::Result<usize> {
+        let mut n = 0;
+        for &pid in self.neighbors(node) {
+            if let Some(PropValue::Edge { .. }) = self.props.get(pid)? {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// All non-edge properties of `node` as `(PropId, value)` pairs.
@@ -213,7 +256,25 @@ impl Graph {
         for (node, slot) in adjacency.iter_mut().enumerate() {
             slot.extend_from_slice(index.neighbors(node as NodeId));
         }
-        Ok(Graph { nodes, props, strings, adjacency })
+
+        // Rebuild the reverse adjacency from the edges, preserving insertion
+        // order (PropIds are allocated sequentially, so sorting by PropId
+        // reproduces the original add order across all sources).
+        let mut edges: Vec<(NodeId, NodeId, PropId)> = Vec::new(); // (target, source, pid)
+        for (src, slot) in adjacency.iter().enumerate() {
+            for &pid in slot {
+                if let Some(PropValue::Edge { end_node }) = props.get(pid)? {
+                    edges.push((end_node, src as NodeId, pid));
+                }
+            }
+        }
+        edges.sort_by_key(|&(_, _, pid)| pid);
+        let mut incoming = vec![Vec::new(); nodes.len()];
+        for (target, source, pid) in edges {
+            incoming[target as usize].push((source, pid));
+        }
+
+        Ok(Graph { nodes, props, strings, adjacency, incoming })
     }
 
     // ── Internals ──────────────────────────────────────────────────────────
@@ -340,6 +401,75 @@ mod tests {
             loaded.string_value(loaded.neighbors(bob)[0]).unwrap().as_deref(),
             Some("a name far longer than fourteen bytes for routing")
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn incoming_edges_track_sources() {
+        let mut g = Graph::new();
+        let a = g.add_node();
+        let b = g.add_node();
+        let c = g.add_node();
+
+        // a → c, b → c, a → b
+        let e_ac = g.add_edge(a, c).unwrap();
+        let e_bc = g.add_edge(b, c).unwrap();
+        let e_ab = g.add_edge(a, b).unwrap();
+
+        // c has two incoming edges, from a and b, in add order.
+        assert_eq!(g.in_degree(c), 2);
+        assert_eq!(g.in_edges(c), &[(a, e_ac), (b, e_bc)]);
+        assert_eq!(g.in_neighbors(c), vec![a, b]);
+
+        // b has one incoming edge (from a) and one outgoing (to c).
+        assert_eq!(g.in_edges(b), &[(a, e_ab)]);
+        assert_eq!(g.in_degree(b), 1);
+        assert_eq!(g.out_degree(b).unwrap(), 1);
+
+        // a has no incoming edges but two outgoing.
+        assert_eq!(g.in_degree(a), 0);
+        assert_eq!(g.out_degree(a).unwrap(), 2);
+    }
+
+    #[test]
+    fn in_edges_of_unknown_node_is_empty() {
+        let mut g = Graph::new();
+        g.add_node();
+        assert_eq!(g.in_edges(99), &[] as &[(NodeId, PropId)]);
+        assert_eq!(g.in_degree(99), 0);
+        assert_eq!(g.in_neighbors(99), Vec::<NodeId>::new());
+    }
+
+    #[test]
+    fn out_degree_counts_edges_not_properties() {
+        let mut g = Graph::new();
+        let a = g.add_node();
+        let b = g.add_node();
+        g.set_str(a, "label").unwrap();          // property, not an edge
+        g.set_property(a, &PropValue::I64(1)).unwrap();
+        g.add_edge(a, b).unwrap();
+        // degree() counts all 3 records; out_degree() counts the 1 edge.
+        assert_eq!(g.degree(a), 3);
+        assert_eq!(g.out_degree(a).unwrap(), 1);
+    }
+
+    #[test]
+    fn incoming_survives_save_open() {
+        let dir = std::env::temp_dir().join(format!("mgraphdb_graph_in_{}", std::process::id()));
+
+        let mut g = Graph::new();
+        let a = g.add_node();
+        let b = g.add_node();
+        let c = g.add_node();
+        g.add_edge(a, c).unwrap();
+        g.add_edge(b, c).unwrap();
+        g.save(&dir).unwrap();
+
+        let loaded = Graph::open(&dir).unwrap();
+        assert_eq!(loaded.in_degree(c), 2);
+        assert_eq!(loaded.in_neighbors(c), vec![a, b]); // add order preserved via PropId sort
+        assert_eq!(loaded.in_degree(a), 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }

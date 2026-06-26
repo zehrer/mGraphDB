@@ -41,6 +41,10 @@ fn main() -> std::io::Result<()> {
         );
     }
 
+    // Incoming edges: who knows Carol?
+    let into_carol: Vec<String> = g.in_neighbors(carol).iter().map(|&s| names(&g, s)).collect();
+    println!("carol in-degree={} ← known by {:?}", g.in_degree(carol), into_carol);
+
     // Show the auto-routed long string resolves transparently.
     let long_pid = g.neighbors(alice)[2]; // 3rd record on alice (the long string)
     println!("alice long prop: {:?}", g.string_value(long_pid)?);
