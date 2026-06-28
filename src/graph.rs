@@ -18,7 +18,7 @@
 
 use crate::index_store::{IndexBuilder, IndexStore};
 use crate::node_store::{NodeFlags, NodeId, NodeStore};
-use crate::prop_store::{PropId, PropStore, PropValue, INLINE_STR_MAX};
+use crate::prop_store::{PropId, PropRecord, PropStore, PropValue, INLINE_STR_MAX};
 use crate::string_store::{Compression, StringStore};
 use std::io;
 use std::path::Path;
@@ -121,18 +121,18 @@ impl Graph {
         // 1. Outgoing edges → detach from each target's incoming list.
         let owned = std::mem::take(&mut self.adjacency[node as usize]);
         for &pid in &owned {
-            if let Some(PropValue::Edge { end_node }) = self.props.get(pid)? {
+            if let Some(PropRecord { value: PropValue::Edge { end_node }, .. }) = self.props.get(pid)? {
                 self.incoming[end_node as usize]
                     .retain(|&(src, p)| !(src == node && p == pid));
             }
-            self.props.update(pid, &PropValue::None)?;
+            self.props.update(pid, &PropRecord::unkeyed(PropValue::None))?;
         }
 
         // 2. Incoming edges → detach the edge record from each source's records.
         let incoming = std::mem::take(&mut self.incoming[node as usize]);
         for &(src, pid) in &incoming {
             self.adjacency[src as usize].retain(|&p| p != pid);
-            self.props.update(pid, &PropValue::None)?;
+            self.props.update(pid, &PropRecord::unkeyed(PropValue::None))?;
         }
 
         // 3. Tombstone. (Owned/incoming vecs were already emptied by mem::take.)
@@ -142,38 +142,40 @@ impl Graph {
 
     // ── Properties ─────────────────────────────────────────────────────────
 
-    /// Attach a typed property `value` to `node`. Returns the new `PropId`.
-    pub fn set_property(&mut self, node: NodeId, value: &PropValue) -> io::Result<PropId> {
+    /// Attach a typed property `value` to `node` under `key` (a property-name
+    /// node, or [`NO_KEY`] for unkeyed). Returns the new `PropId`.
+    pub fn set_property(&mut self, node: NodeId, key: NodeId, value: &PropValue) -> io::Result<PropId> {
         self.check_live(node)?;
-        let pid = self.props.create(value)?;
+        let pid = self.props.create(&PropRecord::new(key, value.clone()))?;
         self.adjacency[node as usize].push(pid);
         self.set_flag(node, NodeFlags::HAS_PROP)?;
         Ok(pid)
     }
 
-    /// Attach a string property, **auto-routing** by length: strings up to
-    /// [`INLINE_STR_MAX`] bytes are stored inline; longer strings are interned
-    /// into the String Store and referenced by `StrId` (REQ-22 / REQ-37).
-    pub fn set_str(&mut self, node: NodeId, s: &str) -> io::Result<PropId> {
+    /// Attach a string property under `key`, **auto-routing** by length: strings
+    /// up to [`INLINE_STR_MAX`] bytes are stored inline; longer strings are
+    /// interned into the String Store and referenced by `StrId` (REQ-22/REQ-37).
+    pub fn set_str(&mut self, node: NodeId, key: NodeId, s: &str) -> io::Result<PropId> {
         let value = if s.len() <= INLINE_STR_MAX {
             PropValue::InlineStr(s.to_owned())
         } else {
             let (_, id) = self.strings.intern(s);
             PropValue::StringRef(id)
         };
-        self.set_property(node, &value)
+        self.set_property(node, key, &value)
     }
 
     // ── Edges ──────────────────────────────────────────────────────────────
 
-    /// Add a directed edge `from → to`. Returns the edge's `PropId`.
+    /// Add a directed edge `from → to` labelled with `predicate` (a label node,
+    /// or [`NO_KEY`] for an unlabelled edge). Returns the edge's `PropId`.
     ///
     /// The edge is owned by `from`; `from` gains `HAS_OUT` and `to` gains
     /// `HAS_IN`.
-    pub fn add_edge(&mut self, from: NodeId, to: NodeId) -> io::Result<PropId> {
+    pub fn add_edge(&mut self, from: NodeId, predicate: NodeId, to: NodeId) -> io::Result<PropId> {
         self.check_live(from)?;
         self.check_live(to)?;
-        let pid = self.props.create(&PropValue::Edge { end_node: to })?;
+        let pid = self.props.create(&PropRecord::new(predicate, PropValue::Edge { end_node: to }))?;
         self.adjacency[from as usize].push(pid);
         self.incoming[to as usize].push((from, pid));
         self.set_flag(from, NodeFlags::HAS_OUT)?;
@@ -198,14 +200,14 @@ impl Graph {
 
     /// Decode the value of property/edge record `pid`.
     pub fn value(&self, pid: PropId) -> io::Result<Option<PropValue>> {
-        self.props.get(pid)
+        Ok(self.props.get(pid)?.map(|r| r.value))
     }
 
     /// Resolve a string-valued property to an owned `String`, transparently
     /// handling inline storage and String Store references. Returns `None` if
     /// the record is not a string type.
     pub fn string_value(&self, pid: PropId) -> io::Result<Option<String>> {
-        Ok(match self.props.get(pid)? {
+        Ok(match self.props.get(pid)?.map(|r| r.value) {
             Some(PropValue::InlineStr(s)) => Some(s),
             Some(PropValue::StringRef(id)) | Some(PropValue::UrlRef(id)) => {
                 self.strings.resolve_id(id).map(str::to_owned)
@@ -214,15 +216,58 @@ impl Graph {
         })
     }
 
+    /// The key (property name / edge predicate) of record `pid`, or `None` if
+    /// out of range.
+    pub fn key_of(&self, pid: PropId) -> io::Result<Option<NodeId>> {
+        Ok(self.props.get(pid)?.map(|r| r.key))
+    }
+
     /// The end nodes of all outgoing edges of `node`, in insertion order.
     pub fn out_edges(&self, node: NodeId) -> io::Result<Vec<NodeId>> {
         let mut out = Vec::new();
         for &pid in self.neighbors(node) {
-            if let Some(PropValue::Edge { end_node }) = self.props.get(pid)? {
+            if let Some(PropRecord { value: PropValue::Edge { end_node }, .. }) = self.props.get(pid)? {
                 out.push(end_node);
             }
         }
         Ok(out)
+    }
+
+    /// The end nodes of `node`'s outgoing edges whose predicate is `predicate`,
+    /// in insertion order.
+    pub fn edges_of_type(&self, node: NodeId, predicate: NodeId) -> io::Result<Vec<NodeId>> {
+        let mut out = Vec::new();
+        for &pid in self.neighbors(node) {
+            if let Some(PropRecord { key, value: PropValue::Edge { end_node } }) = self.props.get(pid)?
+                && key == predicate
+            {
+                out.push(end_node);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The first property of `node` with key `key` (edges excluded), as
+    /// `(PropId, value)`, or `None` if the node has no such property.
+    pub fn get_property(&self, node: NodeId, key: NodeId) -> io::Result<Option<(PropId, PropValue)>> {
+        for &pid in self.neighbors(node) {
+            if let Some(rec) = self.props.get(pid)?
+                && rec.key == key
+                && !matches!(rec.value, PropValue::Edge { .. })
+            {
+                return Ok(Some((pid, rec.value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The string property of `node` with key `key`, resolved transparently
+    /// across inline / String-Store storage. `None` if absent or not a string.
+    pub fn get_str(&self, node: NodeId, key: NodeId) -> io::Result<Option<String>> {
+        match self.get_property(node, key)? {
+            Some((pid, _)) => self.string_value(pid),
+            None => Ok(None),
+        }
     }
 
     /// The `(source, edge PropId)` pairs of every edge pointing **at** `node`,
@@ -252,20 +297,21 @@ impl Graph {
     pub fn out_degree(&self, node: NodeId) -> io::Result<usize> {
         let mut n = 0;
         for &pid in self.neighbors(node) {
-            if let Some(PropValue::Edge { .. }) = self.props.get(pid)? {
+            if let Some(PropRecord { value: PropValue::Edge { .. }, .. }) = self.props.get(pid)? {
                 n += 1;
             }
         }
         Ok(n)
     }
 
-    /// All non-edge properties of `node` as `(PropId, value)` pairs.
-    pub fn properties(&self, node: NodeId) -> io::Result<Vec<(PropId, PropValue)>> {
+    /// All non-edge properties of `node` as `(PropId, key, value)` tuples, in
+    /// insertion order.
+    pub fn properties(&self, node: NodeId) -> io::Result<Vec<(PropId, NodeId, PropValue)>> {
         let mut out = Vec::new();
         for &pid in self.neighbors(node) {
             match self.props.get(pid)? {
-                Some(PropValue::Edge { .. }) | None => {}
-                Some(v) => out.push((pid, v)),
+                Some(PropRecord { value: PropValue::Edge { .. }, .. }) | None => {}
+                Some(rec) => out.push((pid, rec.key, rec.value)),
             }
         }
         Ok(out)
@@ -316,7 +362,7 @@ impl Graph {
         let mut edges: Vec<(NodeId, NodeId, PropId)> = Vec::new(); // (target, source, pid)
         for (src, slot) in adjacency.iter().enumerate() {
             for &pid in slot {
-                if let Some(PropValue::Edge { end_node }) = props.get(pid)? {
+                if let Some(PropRecord { value: PropValue::Edge { end_node }, .. }) = props.get(pid)? {
                     edges.push((end_node, src as NodeId, pid));
                 }
             }
@@ -362,27 +408,54 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prop_store::NO_KEY;
 
     #[test]
     fn build_a_small_graph() {
         let mut g = Graph::new();
         let person = g.add_node();           // class node
+        // Key / predicate nodes — "everything is a node".
+        let name = g.add_node();
+        let age = g.add_node();
+        let knows = g.add_node();
         let alice = g.add_typed_node(person);
         let bob = g.add_typed_node(person);
 
-        g.set_str(alice, "Alice").unwrap();
-        g.set_property(alice, &PropValue::I64(30)).unwrap();
-        g.set_str(bob, "Bob").unwrap();
-        let _knows = g.add_edge(alice, bob).unwrap();
+        g.set_str(alice, name, "Alice").unwrap();
+        g.set_property(alice, age, &PropValue::I64(30)).unwrap();
+        g.set_str(bob, name, "Bob").unwrap();
+        let _knows = g.add_edge(alice, knows, bob).unwrap();
 
-        assert_eq!(g.node_count(), 3);
-        // alice owns: name, age, edge → degree 3
-        assert_eq!(g.degree(alice), 3);
+        assert_eq!(g.degree(alice), 3); // name, age, edge
         assert_eq!(g.out_edges(alice).unwrap(), vec![bob]);
         assert_eq!(g.out_edges(bob).unwrap(), vec![]);
 
+        // Keyed lookups.
+        assert_eq!(g.get_str(alice, name).unwrap().as_deref(), Some("Alice"));
+        assert_eq!(g.get_property(alice, age).unwrap().map(|(_, v)| v), Some(PropValue::I64(30)));
+        assert_eq!(g.get_property(alice, knows).unwrap(), None); // edge, not a property
+        assert_eq!(g.edges_of_type(alice, knows).unwrap(), vec![bob]);
+
         let props = g.properties(alice).unwrap();
         assert_eq!(props.len(), 2); // name + age, edge excluded
+        assert_eq!(props[0].1, name); // key threaded through
+    }
+
+    #[test]
+    fn edges_of_type_filters_by_predicate() {
+        let mut g = Graph::new();
+        let knows = g.add_node();
+        let likes = g.add_node();
+        let a = g.add_node();
+        let b = g.add_node();
+        let c = g.add_node();
+        g.add_edge(a, knows, b).unwrap();
+        g.add_edge(a, likes, c).unwrap();
+        g.add_edge(a, knows, c).unwrap();
+
+        assert_eq!(g.edges_of_type(a, knows).unwrap(), vec![b, c]);
+        assert_eq!(g.edges_of_type(a, likes).unwrap(), vec![c]);
+        assert_eq!(g.out_edges(a).unwrap(), vec![b, c, c]); // all, unfiltered
     }
 
     #[test]
@@ -392,8 +465,8 @@ mod tests {
         let short = "hi";
         let long = "this is definitely longer than fourteen bytes";
 
-        let p_short = g.set_str(n, short).unwrap();
-        let p_long = g.set_str(n, long).unwrap();
+        let p_short = g.set_str(n, NO_KEY, short).unwrap();
+        let p_long = g.set_str(n, NO_KEY, long).unwrap();
 
         // short stays inline, long becomes a StringRef
         assert!(matches!(g.value(p_short).unwrap(), Some(PropValue::InlineStr(_))));
@@ -409,7 +482,7 @@ mod tests {
         let mut g = Graph::new();
         let a = g.add_node();
         let b = g.add_node();
-        g.add_edge(a, b).unwrap();
+        g.add_edge(a, NO_KEY, b).unwrap();
         assert!(g.nodes.get(a).unwrap().flags.has_out());
         assert!(g.nodes.get(b).unwrap().flags.has_in());
         assert!(!g.nodes.get(a).unwrap().flags.has_in());
@@ -418,8 +491,8 @@ mod tests {
     #[test]
     fn operations_on_unknown_node_error() {
         let mut g = Graph::new();
-        assert!(g.set_property(5, &PropValue::None).is_err());
-        assert!(g.add_edge(0, 1).is_err());
+        assert!(g.set_property(5, NO_KEY, &PropValue::None).is_err());
+        assert!(g.add_edge(0, NO_KEY, 1).is_err());
     }
 
     #[test]
@@ -427,8 +500,8 @@ mod tests {
         let mut g = Graph::new();
         let a = g.add_node();
         let b = g.add_node();
-        g.set_str(a, "x").unwrap();
-        g.add_edge(a, b).unwrap();
+        g.set_str(a, NO_KEY, "x").unwrap();
+        g.add_edge(a, NO_KEY, b).unwrap();
 
         let idx = g.build_index().unwrap();
         assert_eq!(idx.node_count(), 2);
@@ -444,9 +517,9 @@ mod tests {
         let person = g.add_node();
         let alice = g.add_typed_node(person);
         let bob = g.add_typed_node(person);
-        g.set_str(alice, "Alice").unwrap();
-        g.set_str(bob, "a name far longer than fourteen bytes for routing").unwrap();
-        g.add_edge(alice, bob).unwrap();
+        g.set_str(alice, NO_KEY, "Alice").unwrap();
+        g.set_str(bob, NO_KEY, "a name far longer than fourteen bytes for routing").unwrap();
+        g.add_edge(alice, NO_KEY, bob).unwrap();
         g.save(&dir).unwrap();
 
         let loaded = Graph::open(&dir).unwrap();
@@ -470,9 +543,9 @@ mod tests {
         let c = g.add_node();
 
         // a → c, b → c, a → b
-        let e_ac = g.add_edge(a, c).unwrap();
-        let e_bc = g.add_edge(b, c).unwrap();
-        let e_ab = g.add_edge(a, b).unwrap();
+        let e_ac = g.add_edge(a, NO_KEY, c).unwrap();
+        let e_bc = g.add_edge(b, NO_KEY, c).unwrap();
+        let e_ab = g.add_edge(a, NO_KEY, b).unwrap();
 
         // c has two incoming edges, from a and b, in add order.
         assert_eq!(g.in_degree(c), 2);
@@ -503,9 +576,9 @@ mod tests {
         let mut g = Graph::new();
         let a = g.add_node();
         let b = g.add_node();
-        g.set_str(a, "label").unwrap();          // property, not an edge
-        g.set_property(a, &PropValue::I64(1)).unwrap();
-        g.add_edge(a, b).unwrap();
+        g.set_str(a, NO_KEY, "label").unwrap();  // property, not an edge
+        g.set_property(a, NO_KEY, &PropValue::I64(1)).unwrap();
+        g.add_edge(a, NO_KEY, b).unwrap();
         // degree() counts all 3 records; out_degree() counts the 1 edge.
         assert_eq!(g.degree(a), 3);
         assert_eq!(g.out_degree(a).unwrap(), 1);
@@ -518,10 +591,10 @@ mod tests {
         let b = g.add_node();
         let c = g.add_node();
         // a → b, b → c, c → b
-        g.add_edge(a, b).unwrap();
-        g.add_edge(b, c).unwrap();
-        g.add_edge(c, b).unwrap();
-        g.set_str(b, "Bob").unwrap();
+        g.add_edge(a, NO_KEY, b).unwrap();
+        g.add_edge(b, NO_KEY, c).unwrap();
+        g.add_edge(c, NO_KEY, b).unwrap();
+        g.set_str(b, NO_KEY, "Bob").unwrap();
 
         assert!(g.delete_node(b).unwrap());
         assert!(g.is_deleted(b));
@@ -543,7 +616,7 @@ mod tests {
         let mut g = Graph::new();
         let a = g.add_node();
         let b = g.add_node();
-        g.add_edge(a, b).unwrap();
+        g.add_edge(a, NO_KEY, b).unwrap();
 
         assert!(g.delete_node(b).unwrap());
         // Already deleted / out of range → false, no error.
@@ -551,18 +624,18 @@ mod tests {
         assert!(!g.delete_node(99).unwrap());
 
         // Writes touching a deleted node are rejected.
-        assert!(g.set_property(b, &PropValue::None).is_err());
-        assert!(g.add_edge(a, b).is_err());
-        assert!(g.add_edge(b, a).is_err());
+        assert!(g.set_property(b, NO_KEY, &PropValue::None).is_err());
+        assert!(g.add_edge(a, NO_KEY, b).is_err());
+        assert!(g.add_edge(b, NO_KEY, a).is_err());
         // Live node still works.
-        assert!(g.set_str(a, "ok").is_ok());
+        assert!(g.set_str(a, NO_KEY, "ok").is_ok());
     }
 
     #[test]
     fn delete_node_handles_self_loop() {
         let mut g = Graph::new();
         let a = g.add_node();
-        g.add_edge(a, a).unwrap(); // self-loop
+        g.add_edge(a, NO_KEY, a).unwrap(); // self-loop
         assert_eq!(g.in_degree(a), 1);
 
         assert!(g.delete_node(a).unwrap());
@@ -579,8 +652,8 @@ mod tests {
         let a = g.add_node();
         let b = g.add_node();
         let c = g.add_node();
-        g.add_edge(a, b).unwrap();
-        g.add_edge(b, c).unwrap();
+        g.add_edge(a, NO_KEY, b).unwrap();
+        g.add_edge(b, NO_KEY, c).unwrap();
         g.delete_node(b).unwrap();
         g.save(&dir).unwrap();
 
@@ -601,8 +674,8 @@ mod tests {
         let a = g.add_node();
         let b = g.add_node();
         let c = g.add_node();
-        g.add_edge(a, c).unwrap();
-        g.add_edge(b, c).unwrap();
+        g.add_edge(a, NO_KEY, c).unwrap();
+        g.add_edge(b, NO_KEY, c).unwrap();
         g.save(&dir).unwrap();
 
         let loaded = Graph::open(&dir).unwrap();
