@@ -49,6 +49,15 @@ fn main() -> std::io::Result<()> {
     let long_pid = g.neighbors(alice)[2]; // 3rd record on alice (the long string)
     println!("alice long prop: {:?}", g.string_value(long_pid)?);
 
+    // Delete Bob: his edges are detached in both directions.
+    g.delete_node(bob)?;
+    println!(
+        "after deleting bob: live nodes={}  carol in-degree={} ← {:?}",
+        g.live_node_count(),
+        g.in_degree(carol),
+        g.in_neighbors(carol).iter().map(|&s| names(&g, s)).collect::<Vec<_>>(),
+    );
+
     // Export the CSR index that backs traversal.
     let idx = g.build_index()?;
     println!("index: {} nodes, {} edges/props", idx.node_count(), idx.edge_count());
