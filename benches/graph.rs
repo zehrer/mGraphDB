@@ -4,7 +4,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use mgraphdb::graph::Graph;
-use mgraphdb::prop_store::PropValue;
+use mgraphdb::prop_store::{PropValue, NO_KEY};
 
 /// A handful of names: most inline (≤14 bytes), one long to exercise routing.
 const NAMES: &[&str] = &[
@@ -30,13 +30,13 @@ fn build(n: u32, edges_per_node: u32) -> Graph {
     }
     let mut rng = Lcg(0x1234_5678);
     for node in 0..n {
-        g.set_str(node, NAMES[(node as usize) % NAMES.len()]).unwrap();
+        g.set_str(node, NO_KEY, NAMES[(node as usize) % NAMES.len()]).unwrap();
         if node % 7 == 0 {
-            g.set_property(node, &PropValue::I64(node as i64)).unwrap();
+            g.set_property(node, NO_KEY, &PropValue::I64(node as i64)).unwrap();
         }
         for _ in 0..edges_per_node {
             let target = (rng.next() as u32) % n;
-            g.add_edge(node, target).unwrap();
+            g.add_edge(node, NO_KEY, target).unwrap();
         }
     }
     g

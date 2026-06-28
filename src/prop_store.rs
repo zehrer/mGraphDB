@@ -14,10 +14,17 @@
 //! ```text
 //! byte  0      PropType (u8)    value-type discriminant
 //! byte  1      extra    (u8)    InlineStr: byte length; others: 0
-//! bytes 2-15   data     [14]   value bytes (see per-type encoding below)
+//! bytes 2-5    key      (u32)   property name / edge predicate NodeId
+//!                                (NodeId::MAX = unkeyed)
+//! bytes 6-15   data     [10]   value bytes (see per-type encoding below)
 //! ```
 //!
-//! Per-type value encoding (all integers little-endian):
+//! Every record carries a **key** (`NodeId`): for a property it is the property
+//! name, for an edge it is the predicate / label. The key is itself a node
+//! ("everything is a node", RDF-predicate style) and is optional — `NodeId::MAX`
+//! means unkeyed.
+//!
+//! Per-type value encoding (all integers little-endian; `data` = bytes 6-15):
 //! ```text
 //! Edge      data[0..4] = end_node_id (u32)
 //! None      data = zeros
@@ -33,15 +40,15 @@
 //! Uuid      data[0..8] = StrId → 16-byte UUID in String Store
 //! Hash      data[0..8] = StrId → hash bytes in String Store
 //! Geo       data[0..8] = StrId → lat(f64)+lon(f64) packed in String Store
-//! InlineStr extra = byte length (0-14), data[0..extra] = UTF-8 bytes
+//! InlineStr extra = byte length (0-10), data[0..extra] = UTF-8 bytes
 //! StringRef data[0..8] = StrId → string in String Store
 //! UrlRef    data[0..8] = StrId → URL in String Store
 //! ```
 //!
-//! Values requiring 16 bytes (i128, UUID, GEO, hashes) are stored in the
-//! String Store and referenced by `StrId` (REQ-37). The linked-list `next`
-//! pointer for graph traversal lives in the corresponding `NodeRecord.first_out`
-//! field in the Node Store, keeping the full 16 bytes available for value data.
+//! Values requiring more than the 10-byte payload (i128, UUID, GEO, hashes, and
+//! strings longer than 10 bytes) are stored in the String Store and referenced
+//! by `StrId` (REQ-37). The linked-list `next` pointer for graph traversal lives
+//! in the corresponding `NodeRecord.first_out` field in the Node Store.
 
 use crate::node_store::NodeId;
 use crate::string_store::StrId;
@@ -56,8 +63,16 @@ const ID_BYTES: u8 = 4;
 const HEADER_LEN: usize = 16;
 const FOOTER_LEN: usize = 20;
 
+/// Byte offset of the key (`NodeId`) within a record.
+const KEY_OFF: usize = 2;
+/// Byte offset of the value payload within a record.
+const VAL_OFF: usize = 6;
+
 /// Maximum number of UTF-8 bytes that can be stored inline in a record.
-pub const INLINE_STR_MAX: usize = 14;
+///
+/// The 16-byte record spends 2 bytes on type/extra and 4 on the key, leaving a
+/// 10-byte value payload.
+pub const INLINE_STR_MAX: usize = 10;
 
 // ── PropType ─────────────────────────────────────────────────────────────────
 
@@ -172,38 +187,59 @@ impl PropValue {
         }
     }
 
-    /// Encode this value into a 16-byte record. Returns an error if an
-    /// `InlineStr` exceeds `INLINE_STR_MAX` bytes.
+}
+
+// ── PropRecord ───────────────────────────────────────────────────────────────
+
+/// A keyed property or edge: a `value` plus its `key` (property name / edge
+/// predicate). `key` is a `NodeId`; `NodeId::MAX` (`NO_KEY`) means unkeyed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropRecord {
+    /// Property name / edge predicate node; `NO_KEY` if unkeyed.
+    pub key: NodeId,
+    /// The typed value (or `Edge`).
+    pub value: PropValue,
+}
+
+/// Sentinel `key` meaning "no property name / predicate".
+pub const NO_KEY: NodeId = NodeId::MAX;
+
+impl PropRecord {
+    /// A keyed record.
+    pub fn new(key: NodeId, value: PropValue) -> Self {
+        PropRecord { key, value }
+    }
+
+    /// An unkeyed record (`key = NO_KEY`).
+    pub fn unkeyed(value: PropValue) -> Self {
+        PropRecord { key: NO_KEY, value }
+    }
+
+    /// Encode into a 16-byte record. Returns an error if an `InlineStr` exceeds
+    /// [`INLINE_STR_MAX`] bytes.
     pub fn encode(&self) -> io::Result<[u8; RECORD_SIZE]> {
         let mut rec = [0u8; RECORD_SIZE];
-        rec[0] = self.prop_type() as u8;
+        rec[0] = self.value.prop_type() as u8;
+        rec[KEY_OFF..KEY_OFF + 4].copy_from_slice(&self.key.to_le_bytes());
 
-        match self {
-            Self::Edge { end_node } => {
-                rec[2..6].copy_from_slice(&end_node.to_le_bytes());
+        // Value payload lives in rec[VAL_OFF..]; `d(n)` is its first n bytes.
+        macro_rules! d {
+            ($n:expr) => { &mut rec[VAL_OFF..VAL_OFF + $n] };
+        }
+        match &self.value {
+            PropValue::Edge { end_node } => d!(4).copy_from_slice(&end_node.to_le_bytes()),
+            PropValue::None => {}
+            PropValue::Bool(v) => rec[VAL_OFF] = *v as u8,
+            PropValue::I64(v) => d!(8).copy_from_slice(&v.to_le_bytes()),
+            PropValue::I128Ref(id) | PropValue::F128Ref(id) | PropValue::Uuid(id)
+            | PropValue::Hash(id) | PropValue::Geo(id) | PropValue::StringRef(id)
+            | PropValue::UrlRef(id) => d!(8).copy_from_slice(&id.to_le_bytes()),
+            PropValue::F64(v) => d!(8).copy_from_slice(&v.to_bits().to_le_bytes()),
+            PropValue::Date(v) | PropValue::DateTime(v) | PropValue::Duration(v) => {
+                d!(8).copy_from_slice(&v.to_le_bytes())
             }
-            Self::None => {}
-            Self::Bool(v) => {
-                rec[2] = *v as u8;
-            }
-            Self::I64(v) => {
-                rec[2..10].copy_from_slice(&v.to_le_bytes());
-            }
-            Self::I128Ref(id) | Self::F128Ref(id) | Self::Uuid(id)
-            | Self::Hash(id) | Self::Geo(id) | Self::StringRef(id)
-            | Self::UrlRef(id) => {
-                rec[2..10].copy_from_slice(&id.to_le_bytes());
-            }
-            Self::F64(v) => {
-                rec[2..10].copy_from_slice(&v.to_bits().to_le_bytes());
-            }
-            Self::Date(v) | Self::DateTime(v) | Self::Duration(v) => {
-                rec[2..10].copy_from_slice(&v.to_le_bytes());
-            }
-            Self::Time(v) => {
-                rec[2..10].copy_from_slice(&v.to_le_bytes());
-            }
-            Self::InlineStr(s) => {
+            PropValue::Time(v) => d!(8).copy_from_slice(&v.to_le_bytes()),
+            PropValue::InlineStr(s) => {
                 let bytes = s.as_bytes();
                 if bytes.len() > INLINE_STR_MAX {
                     return Err(bad(&format!(
@@ -212,38 +248,38 @@ impl PropValue {
                     )));
                 }
                 rec[1] = bytes.len() as u8;
-                rec[2..2 + bytes.len()].copy_from_slice(bytes);
+                d!(bytes.len()).copy_from_slice(bytes);
             }
         }
         Ok(rec)
     }
 
-    /// Decode a 16-byte record into a `PropValue`.
+    /// Decode a 16-byte record into a `PropRecord`.
     pub fn decode(rec: &[u8; RECORD_SIZE]) -> io::Result<Self> {
         let ptype = PropType::from_u8(rec[0])?;
         let extra = rec[1];
-        let data  = &rec[2..]; // 14 bytes
+        let key = u32::from_le_bytes(rec[KEY_OFF..KEY_OFF + 4].try_into().unwrap());
+        let data = &rec[VAL_OFF..]; // 10 bytes
 
-        Ok(match ptype {
-            PropType::Edge => {
-                let end_node = u32::from_le_bytes(data[0..4].try_into().unwrap());
-                Self::Edge { end_node }
-            }
-            PropType::None      => Self::None,
-            PropType::Bool      => Self::Bool(data[0] != 0),
-            PropType::I64       => Self::I64(i64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::I128Ref   => Self::I128Ref(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::F64       => Self::F64(f64::from_bits(u64::from_le_bytes(data[0..8].try_into().unwrap()))),
-            PropType::F128Ref   => Self::F128Ref(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::Date      => Self::Date(i64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::Time      => Self::Time(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::DateTime  => Self::DateTime(i64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::Duration  => Self::Duration(i64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::Uuid      => Self::Uuid(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::Hash      => Self::Hash(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::Geo       => Self::Geo(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::StringRef => Self::StringRef(u64::from_le_bytes(data[0..8].try_into().unwrap())),
-            PropType::UrlRef    => Self::UrlRef(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+        let value = match ptype {
+            PropType::Edge => PropValue::Edge {
+                end_node: u32::from_le_bytes(data[0..4].try_into().unwrap()),
+            },
+            PropType::None      => PropValue::None,
+            PropType::Bool      => PropValue::Bool(data[0] != 0),
+            PropType::I64       => PropValue::I64(i64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::I128Ref   => PropValue::I128Ref(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::F64       => PropValue::F64(f64::from_bits(u64::from_le_bytes(data[0..8].try_into().unwrap()))),
+            PropType::F128Ref   => PropValue::F128Ref(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::Date      => PropValue::Date(i64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::Time      => PropValue::Time(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::DateTime  => PropValue::DateTime(i64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::Duration  => PropValue::Duration(i64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::Uuid      => PropValue::Uuid(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::Hash      => PropValue::Hash(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::Geo       => PropValue::Geo(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::StringRef => PropValue::StringRef(u64::from_le_bytes(data[0..8].try_into().unwrap())),
+            PropType::UrlRef    => PropValue::UrlRef(u64::from_le_bytes(data[0..8].try_into().unwrap())),
             PropType::InlineStr => {
                 let len = extra as usize;
                 if len > INLINE_STR_MAX {
@@ -251,9 +287,10 @@ impl PropValue {
                 }
                 let s = std::str::from_utf8(&data[0..len])
                     .map_err(|_| bad("inline string is not valid UTF-8"))?;
-                Self::InlineStr(s.to_owned())
+                PropValue::InlineStr(s.to_owned())
             }
-        })
+        };
+        Ok(PropRecord { key, value })
     }
 }
 
@@ -284,26 +321,26 @@ impl PropStore {
 
     pub fn is_empty(&self) -> bool { self.records.is_empty() }
 
-    /// Encode and store `value`, returning its new `PropId`.
-    pub fn create(&mut self, value: &PropValue) -> io::Result<PropId> {
+    /// Encode and store `record`, returning its new `PropId`.
+    pub fn create(&mut self, record: &PropRecord) -> io::Result<PropId> {
         let id = self.records.len() as PropId;
-        self.records.push(value.encode()?);
+        self.records.push(record.encode()?);
         Ok(id)
     }
 
-    /// Decode and return the value at `id`, or `None` if out of range.
-    pub fn get(&self, id: PropId) -> io::Result<Option<PropValue>> {
+    /// Decode and return the record at `id`, or `None` if out of range.
+    pub fn get(&self, id: PropId) -> io::Result<Option<PropRecord>> {
         match self.records.get(id as usize) {
             None => Ok(None),
-            Some(rec) => PropValue::decode(rec).map(Some),
+            Some(rec) => PropRecord::decode(rec).map(Some),
         }
     }
 
     /// Overwrite the record at `id`. Returns `false` if `id` is out of range.
-    pub fn update(&mut self, id: PropId, value: &PropValue) -> io::Result<bool> {
+    pub fn update(&mut self, id: PropId, record: &PropRecord) -> io::Result<bool> {
         match self.records.get_mut(id as usize) {
             None => Ok(false),
-            Some(slot) => { *slot = value.encode()?; Ok(true) }
+            Some(slot) => { *slot = record.encode()?; Ok(true) }
         }
     }
 
@@ -409,7 +446,28 @@ mod tests {
     use super::*;
 
     fn rt(v: PropValue) -> PropValue {
-        PropValue::decode(&v.encode().unwrap()).unwrap()
+        PropRecord::decode(&PropRecord::unkeyed(v).encode().unwrap()).unwrap().value
+    }
+
+    #[test]
+    fn key_round_trips_and_is_independent_of_value() {
+        // The key survives encode/decode and does not disturb the value.
+        let rec = PropRecord::new(7, PropValue::I64(-42));
+        let back = PropRecord::decode(&rec.encode().unwrap()).unwrap();
+        assert_eq!(back, rec);
+        assert_eq!(back.key, 7);
+        assert_eq!(back.value, PropValue::I64(-42));
+
+        // Unkeyed default.
+        assert_eq!(PropRecord::unkeyed(PropValue::None).key, NO_KEY);
+    }
+
+    #[test]
+    fn keyed_edge_carries_predicate_and_end_node() {
+        let rec = PropRecord::new(99, PropValue::Edge { end_node: 5 });
+        let back = PropRecord::decode(&rec.encode().unwrap()).unwrap();
+        assert_eq!(back.key, 99); // predicate
+        assert_eq!(back.value, PropValue::Edge { end_node: 5 });
     }
 
     #[test]
@@ -465,39 +523,38 @@ mod tests {
 
     #[test]
     fn encode_decode_inline_str() {
-        for s in ["", "hi", "hello", "héllo", "日本語", "exactly14byts!"] {
-            if s.len() <= INLINE_STR_MAX {
-                let v = PropValue::InlineStr(s.to_owned());
-                assert_eq!(rt(v), PropValue::InlineStr(s.to_owned()));
-            }
+        for s in ["", "hi", "hello", "héllo", "日本語", "tenbytes!!"] {
+            assert!(s.len() <= INLINE_STR_MAX, "{s:?} should fit inline");
+            let v = PropValue::InlineStr(s.to_owned());
+            assert_eq!(rt(v), PropValue::InlineStr(s.to_owned()));
         }
     }
 
     #[test]
     fn inline_str_too_long_returns_error() {
         let long = "a".repeat(INLINE_STR_MAX + 1);
-        assert!(PropValue::InlineStr(long).encode().is_err());
+        assert!(PropRecord::unkeyed(PropValue::InlineStr(long)).encode().is_err());
     }
 
     #[test]
     fn create_and_get() {
         let mut store = PropStore::new();
-        let id1 = store.create(&PropValue::Bool(true)).unwrap();
-        let id2 = store.create(&PropValue::I64(-99)).unwrap();
+        let id1 = store.create(&PropRecord::new(3, PropValue::Bool(true))).unwrap();
+        let id2 = store.create(&PropRecord::unkeyed(PropValue::I64(-99))).unwrap();
         assert_eq!(id1, 0);
         assert_eq!(id2, 1);
-        assert_eq!(store.get(id1).unwrap(), Some(PropValue::Bool(true)));
-        assert_eq!(store.get(id2).unwrap(), Some(PropValue::I64(-99)));
+        assert_eq!(store.get(id1).unwrap(), Some(PropRecord::new(3, PropValue::Bool(true))));
+        assert_eq!(store.get(id2).unwrap(), Some(PropRecord::unkeyed(PropValue::I64(-99))));
         assert_eq!(store.get(99).unwrap(), None);
     }
 
     #[test]
     fn update_record() {
         let mut store = PropStore::new();
-        let id = store.create(&PropValue::Bool(false)).unwrap();
-        assert!(store.update(id, &PropValue::Bool(true)).unwrap());
-        assert_eq!(store.get(id).unwrap(), Some(PropValue::Bool(true)));
-        assert!(!store.update(99, &PropValue::None).unwrap());
+        let id = store.create(&PropRecord::unkeyed(PropValue::Bool(false))).unwrap();
+        assert!(store.update(id, &PropRecord::new(8, PropValue::Bool(true))).unwrap());
+        assert_eq!(store.get(id).unwrap(), Some(PropRecord::new(8, PropValue::Bool(true))));
+        assert!(!store.update(99, &PropRecord::unkeyed(PropValue::None)).unwrap());
     }
 
     #[test]
@@ -505,25 +562,25 @@ mod tests {
         let dir  = std::env::temp_dir();
         let path = dir.join(format!("mgraphdb_ps_{}.seg", std::process::id()));
 
-        let values = [
-            PropValue::Edge { end_node: 7 },
-            PropValue::Bool(true),
-            PropValue::I64(-42),
-            PropValue::F64(std::f64::consts::E),
-            PropValue::Date(18_628),
-            PropValue::InlineStr("hello".to_owned()),
-            PropValue::StringRef(0xABCD),
-            PropValue::Uuid(0x1234_5678_9ABC_DEF0),
+        let records = [
+            PropRecord::new(1, PropValue::Edge { end_node: 7 }),
+            PropRecord::new(2, PropValue::Bool(true)),
+            PropRecord::unkeyed(PropValue::I64(-42)),
+            PropRecord::new(4, PropValue::F64(std::f64::consts::E)),
+            PropRecord::new(5, PropValue::Date(18_628)),
+            PropRecord::new(6, PropValue::InlineStr("hello".to_owned())),
+            PropRecord::new(7, PropValue::StringRef(0xABCD)),
+            PropRecord::unkeyed(PropValue::Uuid(0x1234_5678_9ABC_DEF0)),
         ];
 
         let mut src = PropStore::new();
-        let ids: Vec<_> = values.iter().map(|v| src.create(v).unwrap()).collect();
+        let ids: Vec<_> = records.iter().map(|r| src.create(r).unwrap()).collect();
         src.save(&path).unwrap();
 
         let loaded = PropStore::open(&path).unwrap();
-        assert_eq!(loaded.len(), values.len());
-        for (i, v) in values.iter().enumerate() {
-            assert_eq!(loaded.get(ids[i]).unwrap().as_ref(), Some(v));
+        assert_eq!(loaded.len(), records.len());
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(loaded.get(ids[i]).unwrap().as_ref(), Some(r));
         }
 
         std::fs::remove_file(&path).ok();
@@ -534,7 +591,7 @@ mod tests {
         let dir  = std::env::temp_dir();
         let path = dir.join(format!("mgraphdb_ps_bad_{}.seg", std::process::id()));
         let mut s = PropStore::new();
-        s.create(&PropValue::None).unwrap();
+        s.create(&PropRecord::unkeyed(PropValue::None)).unwrap();
         s.save(&path).unwrap();
 
         let mut bytes = std::fs::read(&path).unwrap();
@@ -549,7 +606,7 @@ mod tests {
         let dir  = std::env::temp_dir();
         let path = dir.join(format!("mgraphdb_ps_crc_{}.seg", std::process::id()));
         let mut s = PropStore::new();
-        s.create(&PropValue::I64(42)).unwrap();
+        s.create(&PropRecord::unkeyed(PropValue::I64(42))).unwrap();
         s.save(&path).unwrap();
 
         let mut bytes = std::fs::read(&path).unwrap();

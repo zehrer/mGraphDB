@@ -31,8 +31,9 @@ String Store         append-only deduplicated UTF-8 storage          ✓ impleme
 ## Graph API
 
 `mgraphdb::graph::Graph` ties the layers together. Edges are just `Edge`-valued
-properties — "everything is a node". Short strings are stored inline; longer
-ones are routed into the String Store automatically.
+properties — "everything is a node". Every property and edge carries a **key**
+(a `NodeId` naming the property / labelling the edge, RDF-predicate style). Short
+strings are stored inline; longer ones route into the String Store automatically.
 
 ```rust
 use mgraphdb::graph::Graph;
@@ -41,18 +42,21 @@ use mgraphdb::prop_store::PropValue;
 let mut g = Graph::new();
 
 let person = g.add_node();              // a class node, used as a type
+let name   = g.add_node();             // key / predicate nodes
+let age    = g.add_node();
+let knows  = g.add_node();
 let alice  = g.add_typed_node(person);
 let bob    = g.add_typed_node(person);
 
-g.set_str(alice, "Alice")?;             // inline (≤ 14 bytes)
-g.set_property(alice, &PropValue::I64(30))?;
-g.set_str(bob, "Bob")?;
-g.add_edge(alice, bob)?;                // Alice → Bob
+g.set_str(alice, name, "Alice")?;      // inline (≤ 10 bytes)
+g.set_property(alice, age, &PropValue::I64(30))?;
+g.set_str(bob, name, "Bob")?;
+g.add_edge(alice, knows, bob)?;        // Alice KNOWS Bob
 
-assert_eq!(g.out_edges(alice)?, vec![bob]);
-assert_eq!(g.properties(alice)?.len(), 2);   // name + age (edge excluded)
+assert_eq!(g.get_str(alice, name)?.as_deref(), Some("Alice"));
+assert_eq!(g.edges_of_type(alice, knows)?, vec![bob]);
 
-g.save("graph_dir")?;                   // nodes + props + strings + CSR index
+g.save("graph_dir")?;                  // nodes + props + strings + CSR index
 let reloaded = Graph::open("graph_dir")?;
 ```
 
