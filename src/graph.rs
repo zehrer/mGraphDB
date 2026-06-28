@@ -270,6 +270,89 @@ impl Graph {
         }
     }
 
+    // ── Find (reverse lookup) ──────────────────────────────────────────────
+    //
+    // These are full scans over live nodes (O(total records)). They are the
+    // correct, allocation-light starting point; a secondary inverted index
+    // `(key, value) → [node]` is a future optimisation.
+
+    /// All live nodes that have a property `key = value` (edges excluded), in
+    /// ascending node order. Each matching node appears once.
+    ///
+    /// Value comparison is exact `PropValue` equality. For strings prefer
+    /// [`Graph::find_by_str`], which compares the resolved text regardless of
+    /// inline / String-Store storage.
+    pub fn find_by_property(&self, key: NodeId, value: &PropValue) -> io::Result<Vec<NodeId>> {
+        let mut out = Vec::new();
+        for node in 0..self.nodes.len() as NodeId {
+            if self.is_deleted(node) {
+                continue;
+            }
+            for &pid in self.neighbors(node) {
+                if let Some(rec) = self.props.get(pid)?
+                    && rec.key == key
+                    && !matches!(rec.value, PropValue::Edge { .. })
+                    && &rec.value == value
+                {
+                    out.push(node);
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// All live nodes whose string property `key` equals `s`, comparing the
+    /// resolved text (so inline and String-Store storage match alike), in
+    /// ascending node order. Each matching node appears once.
+    pub fn find_by_str(&self, key: NodeId, s: &str) -> io::Result<Vec<NodeId>> {
+        let mut out = Vec::new();
+        for node in 0..self.nodes.len() as NodeId {
+            if self.is_deleted(node) {
+                continue;
+            }
+            for &pid in self.neighbors(node) {
+                if let Some(rec) = self.props.get(pid)?
+                    && rec.key == key
+                {
+                    let hit = match &rec.value {
+                        PropValue::InlineStr(v) => v == s,
+                        PropValue::StringRef(id) | PropValue::UrlRef(id) => {
+                            self.strings.resolve_id(*id) == Some(s)
+                        }
+                        _ => false,
+                    };
+                    if hit {
+                        out.push(node);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// All live nodes that have at least one property (edges excluded) under
+    /// `key`, in ascending node order.
+    pub fn find_by_key(&self, key: NodeId) -> io::Result<Vec<NodeId>> {
+        let mut out = Vec::new();
+        for node in 0..self.nodes.len() as NodeId {
+            if self.is_deleted(node) {
+                continue;
+            }
+            for &pid in self.neighbors(node) {
+                if let Some(rec) = self.props.get(pid)?
+                    && rec.key == key
+                    && !matches!(rec.value, PropValue::Edge { .. })
+                {
+                    out.push(node);
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The `(source, edge PropId)` pairs of every edge pointing **at** `node`,
     /// in the order the edges were added. Served from the precomputed reverse
     /// adjacency, so no record decoding is needed.
@@ -684,5 +767,62 @@ mod tests {
         assert_eq!(loaded.in_degree(a), 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_by_property_and_key() {
+        let mut g = Graph::new();
+        let name = g.add_node();
+        let age = g.add_node();
+        let a = g.add_node();
+        let b = g.add_node();
+        let c = g.add_node();
+        g.set_str(a, name, "Alice").unwrap();
+        g.set_property(a, age, &PropValue::I64(30)).unwrap();
+        g.set_str(b, name, "Bob").unwrap();
+        g.set_property(b, age, &PropValue::I64(30)).unwrap();
+        g.set_str(c, name, "Alice").unwrap(); // duplicate name value
+
+        // Exact value match, ascending node order, each node once.
+        assert_eq!(g.find_by_property(age, &PropValue::I64(30)).unwrap(), vec![a, b]);
+        assert_eq!(g.find_by_property(age, &PropValue::I64(99)).unwrap(), vec![]);
+
+        // All nodes that have an `age` property at all.
+        assert_eq!(g.find_by_key(age).unwrap(), vec![a, b]);
+        assert_eq!(g.find_by_key(name).unwrap(), vec![a, b, c]);
+    }
+
+    #[test]
+    fn find_by_str_matches_across_storage() {
+        let mut g = Graph::new();
+        let bio = g.add_node();
+        let a = g.add_node();
+        let b = g.add_node();
+        let long = "a biography longer than ten bytes, so it routes to the String Store";
+        g.set_str(a, bio, long).unwrap();   // → StringRef
+        g.set_str(b, bio, "short").unwrap(); // → inline
+
+        // Resolves regardless of inline vs String-Store storage.
+        assert_eq!(g.find_by_str(bio, long).unwrap(), vec![a]);
+        assert_eq!(g.find_by_str(bio, "short").unwrap(), vec![b]);
+        assert_eq!(g.find_by_str(bio, "absent").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn find_skips_deleted_nodes_and_keys() {
+        let mut g = Graph::new();
+        let name = g.add_node();
+        let other = g.add_node();
+        let a = g.add_node();
+        let b = g.add_node();
+        g.set_str(a, name, "Alice").unwrap();
+        g.set_str(b, name, "Alice").unwrap();
+
+        // A different key does not match the same value.
+        assert_eq!(g.find_by_str(other, "Alice").unwrap(), vec![]);
+
+        // Deleting a node removes it from results.
+        g.delete_node(a).unwrap();
+        assert_eq!(g.find_by_str(name, "Alice").unwrap(), vec![b]);
     }
 }
