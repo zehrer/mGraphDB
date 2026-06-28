@@ -134,5 +134,56 @@ fn bench_save_open(c: &mut Criterion) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-criterion_group!(benches, bench_build, bench_traverse, bench_build_index, bench_find, bench_save_open);
+/// Benchmark on a real-world graph (SNAP ca-HepTh by default): a clustered,
+/// power-law collaboration network — very different from the uniform-random
+/// `build()` wiring above.
+///
+/// The dataset is not committed. Place the plain-text edge list at
+/// `benches/data/ca-HepTh.txt` (or set `MGRAPHDB_GRAPH` to a path); if it is
+/// absent this group is skipped. See `benches/data/README.md`.
+fn bench_realworld(c: &mut Criterion) {
+    let path = std::env::var("MGRAPHDB_GRAPH")
+        .unwrap_or_else(|_| "benches/data/ca-HepTh.txt".to_string());
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!(
+                "graph_realworld: skipped — dataset not found at {path} \
+                 (set MGRAPHDB_GRAPH or see benches/data/README.md)"
+            );
+            return;
+        }
+    };
+    let g = Graph::from_edge_list(std::io::BufReader::new(file)).unwrap();
+    eprintln!(
+        "graph_realworld: loaded {} nodes, {} edges from {path}",
+        g.node_count(),
+        g.record_count()
+    );
+
+    let n = g.node_count() as u32;
+    let mut group = c.benchmark_group("graph_realworld");
+    group.throughput(Throughput::Elements(g.record_count() as u64));
+    group.bench_function("traverse_out_all", |b| {
+        b.iter(|| {
+            let mut total = 0usize;
+            for node in 0..n {
+                total += g.out_edges(node).unwrap().len();
+            }
+            total
+        });
+    });
+    group.bench_function("build_index", |b| b.iter(|| g.build_index().unwrap()));
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_build,
+    bench_traverse,
+    bench_build_index,
+    bench_find,
+    bench_realworld,
+    bench_save_open
+);
 criterion_main!(benches);
