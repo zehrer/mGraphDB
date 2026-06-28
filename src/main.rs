@@ -42,6 +42,11 @@ fn main() -> std::io::Result<()> {
     println!("alice age: {:?}", g.get_property(alice, age)?.map(|(_, v)| v));
     println!("alice bio: {:?}", g.get_str(alice, bio)?); // long → routed, resolved transparently
 
+    // Reverse lookup: find nodes by property value.
+    let found = g.find_by_str(name, "Carol")?;
+    println!("find name=\"Carol\": {:?}", found.iter().map(|&n| name_of(&g, n)).collect::<Vec<_>>());
+    println!("nodes with an age: {:?}", g.find_by_key(age)?.iter().map(|&n| name_of(&g, n)).collect::<Vec<_>>());
+
     // Incoming edges: who knows Carol?
     let into_carol: Vec<String> = g.in_neighbors(carol).iter().map(|&s| name_of(&g, s)).collect();
     println!("carol in-degree={} ← known by {:?}", g.in_degree(carol), into_carol);

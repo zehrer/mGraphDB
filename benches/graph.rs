@@ -101,6 +101,21 @@ fn bench_build_index(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_find(c: &mut Criterion) {
+    let n = 10_000u32;
+    let g = build(n, 4);
+    let mut group = c.benchmark_group("graph_find");
+    // A find is a full scan over every owned record.
+    group.throughput(Throughput::Elements(g.record_count() as u64));
+    group.bench_function("find_by_str", |b| {
+        b.iter(|| g.find_by_str(NO_KEY, "Alice").unwrap().len());
+    });
+    group.bench_function("find_by_property_i64", |b| {
+        b.iter(|| g.find_by_property(NO_KEY, &PropValue::I64(42)).unwrap().len());
+    });
+    group.finish();
+}
+
 fn bench_save_open(c: &mut Criterion) {
     let n = 10_000u32;
     let g = build(n, 4);
@@ -119,5 +134,5 @@ fn bench_save_open(c: &mut Criterion) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-criterion_group!(benches, bench_build, bench_traverse, bench_build_index, bench_save_open);
+criterion_group!(benches, bench_build, bench_traverse, bench_build_index, bench_find, bench_save_open);
 criterion_main!(benches);
