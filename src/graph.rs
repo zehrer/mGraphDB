@@ -18,9 +18,10 @@
 
 use crate::index_store::{IndexBuilder, IndexStore};
 use crate::node_store::{NodeFlags, NodeId, NodeStore};
-use crate::prop_store::{PropId, PropRecord, PropStore, PropValue, INLINE_STR_MAX};
+use crate::prop_store::{PropId, PropRecord, PropStore, PropValue, INLINE_STR_MAX, NO_KEY};
 use crate::string_store::{Compression, StringStore};
-use std::io;
+use std::collections::HashMap;
+use std::io::{self, BufRead};
 use std::path::Path;
 
 /// The in-memory graph: nodes, properties/edges, strings, and live adjacency.
@@ -61,6 +62,41 @@ impl Graph {
             adjacency: Vec::new(),
             incoming: Vec::new(),
         }
+    }
+
+    /// Build a graph from a SNAP-style **edge list**: one `from<whitespace>to`
+    /// pair of integer node ids per line. Blank lines and `#` comments (the
+    /// SNAP header) are skipped. Each line becomes one directed, unlabelled
+    /// edge (`NO_KEY`).
+    ///
+    /// The source ids may be sparse; they are remapped to contiguous `NodeId`s
+    /// in first-seen order. Undirected datasets (e.g. ca-HepTh) list each edge
+    /// in both directions, so loading them yields a symmetric directed graph.
+    ///
+    /// Returns an error on a malformed (non-numeric, single-column) data line.
+    pub fn from_edge_list(reader: impl BufRead) -> io::Result<Self> {
+        let mut g = Graph::new();
+        let mut map: HashMap<u64, NodeId> = HashMap::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split_whitespace();
+            let (a, b) = match (cols.next(), cols.next()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Err(bad_edge(line)),
+            };
+            let from = a.parse::<u64>().map_err(|_| bad_edge(line))?;
+            let to = b.parse::<u64>().map_err(|_| bad_edge(line))?;
+
+            let fid = *map.entry(from).or_insert_with(|| g.add_node());
+            let tid = *map.entry(to).or_insert_with(|| g.add_node());
+            g.add_edge(fid, NO_KEY, tid)?;
+        }
+        Ok(g)
     }
 
     // ── Nodes ──────────────────────────────────────────────────────────────
@@ -486,12 +522,18 @@ impl Graph {
     }
 }
 
+fn bad_edge(line: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("graph: malformed edge-list line: {line:?}"),
+    )
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prop_store::NO_KEY;
 
     #[test]
     fn build_a_small_graph() {
@@ -806,6 +848,43 @@ mod tests {
         assert_eq!(g.find_by_str(bio, long).unwrap(), vec![a]);
         assert_eq!(g.find_by_str(bio, "short").unwrap(), vec![b]);
         assert_eq!(g.find_by_str(bio, "absent").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn from_edge_list_parses_and_remaps() {
+        // Sparse ids (100, 250, 7) with comments and blank lines, SNAP-style.
+        let input = "\
+# Directed graph: test.txt
+# Nodes: 3 Edges: 3
+100\t250
+250\t7
+7\t100
+
+";
+        let g = Graph::from_edge_list(std::io::Cursor::new(input)).unwrap();
+        assert_eq!(g.node_count(), 3);     // 100, 250, 7 → contiguous 0,1,2
+        assert_eq!(g.record_count(), 3);   // three edges
+        // First-seen order: 100→0, 250→1, 7→2.
+        assert_eq!(g.out_edges(0).unwrap(), vec![1]); // 100 → 250
+        assert_eq!(g.out_edges(1).unwrap(), vec![2]); // 250 → 7
+        assert_eq!(g.out_edges(2).unwrap(), vec![0]); // 7 → 100
+        assert_eq!(g.in_degree(0), 1);
+    }
+
+    #[test]
+    fn from_edge_list_undirected_is_symmetric() {
+        // Undirected datasets list both directions; loading yields symmetry.
+        let g = Graph::from_edge_list(std::io::Cursor::new("0 1\n1 0\n")).unwrap();
+        assert_eq!(g.out_edges(0).unwrap(), vec![1]);
+        assert_eq!(g.out_edges(1).unwrap(), vec![0]);
+        assert_eq!(g.in_degree(0), 1);
+        assert_eq!(g.in_degree(1), 1);
+    }
+
+    #[test]
+    fn from_edge_list_rejects_malformed() {
+        assert!(Graph::from_edge_list(std::io::Cursor::new("1 2\nnot_a_number\n")).is_err());
+        assert!(Graph::from_edge_list(std::io::Cursor::new("1 x\n")).is_err());
     }
 
     #[test]
